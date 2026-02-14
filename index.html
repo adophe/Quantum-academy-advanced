@@ -1,0 +1,491 @@
+
+import React, { useState, useRef, useEffect } from 'react';
+import { Message, AppSettings, UserMode, InteractionMode, Subject, SessionLength } from './types';
+import { AdaptiveAcademyService } from './services/geminiService';
+
+const STORAGE_KEYS = {
+  HISTORY: 'qa_history_v3',
+  SETTINGS: 'qa_settings_v3'
+};
+
+const App: React.FC = () => {
+  const [messages, setMessages] = useState<Message[]>([]);
+  const [input, setInput] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [visualizing, setVisualizing] = useState(false);
+  const [isScanning, setIsScanning] = useState(false);
+  const [activeVoice, setActiveVoice] = useState<number | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [selectedImage, setSelectedImage] = useState<string | null>(null);
+  
+  // Start at step 0 (Identity) as we are now "independent" from explicit key selection UI
+  const [configStep, setConfigStep] = useState<number>(0);
+  const [isConfiguring, setIsConfiguring] = useState(true);
+
+  const [settings, setSettings] = useState<AppSettings>(() => {
+    try {
+      const saved = localStorage.getItem(STORAGE_KEYS.SETTINGS);
+      return saved ? JSON.parse(saved) : { 
+        userName: '', 
+        userMode: 'normal', 
+        interactionMode: 'teaching',
+        activeSubject: 'None',
+        activeTopic: '',
+        preferredFormat: 'Both',
+        sessionLength: 'Short (15 min)',
+        isCameraOn: false, 
+        advancedMode: false 
+      };
+    } catch (e) {
+      return { 
+        userName: '', userMode: 'normal', interactionMode: 'teaching', activeSubject: 'None', 
+        activeTopic: '', preferredFormat: 'Both', sessionLength: 'Short (15 min)', isCameraOn: false, advancedMode: false 
+      };
+    }
+  });
+
+  const videoRef = useRef<HTMLVideoElement>(null);
+  const canvasRef = useRef<HTMLCanvasElement>(null);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const recognitionRef = useRef<any>(null);
+  const academyService = useRef(new AdaptiveAcademyService());
+
+  useEffect(() => {
+    if (settings.userName && settings.activeSubject !== 'None' && settings.activeTopic) {
+      // Auto-skip setup if settings exist, but allow session restart logic
+      setIsConfiguring(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isConfiguring && messages.length === 0 && settings.activeTopic) {
+      triggerStart();
+    }
+  }, [isConfiguring]);
+
+  const triggerStart = async () => {
+    setLoading(true);
+    try {
+      const res = await academyService.current.processPedagogy(
+        `Initialize Neural Link. Provide a warm scientific greeting for ${settings.userName} and start the first chunk of teaching for the topic: ${settings.activeTopic}.`,
+        [],
+        settings
+      );
+      const msg: Message = {
+        role: 'model',
+        text: `[[ASSESSMENT]]${res.assessment}[[CONTENT]]### ${res.subject}\n\n${res.explanation}\n\n---\n**Concept Check:** ${res.followUp}`,
+        timestamp: Date.now()
+      };
+      setMessages([msg]);
+      if (settings.userMode === 'sight' || settings.preferredFormat === 'Voice') speak(res.explanation, msg.timestamp);
+    } catch (e) {
+      setMessages(p => [...p, { 
+        role: 'model', 
+        text: "Neural processing interrupt. Please check your connection and resynchronize.", 
+        timestamp: Date.now() 
+      }]);
+    }
+    setLoading(false);
+  };
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.HISTORY, JSON.stringify(messages));
+    scrollRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (window.renderMathInElement) {
+      window.renderMathInElement(document.body, {
+        delimiters: [{left: '$$', right: '$$', display: true}, {left: '$', right: '$', display: false}],
+        throwOnError: false
+      });
+    }
+  }, [messages]);
+
+  useEffect(() => {
+    localStorage.setItem(STORAGE_KEYS.SETTINGS, JSON.stringify(settings));
+  }, [settings]);
+
+  useEffect(() => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (SpeechRecognition) {
+      recognitionRef.current = new SpeechRecognition();
+      recognitionRef.current.continuous = true;
+      recognitionRef.current.interimResults = true;
+      recognitionRef.current.onresult = (event: any) => {
+        let t = '';
+        for (let i = event.resultIndex; i < event.results.length; ++i) {
+          if (event.results[i].isFinal) t += event.results[i][0].transcript;
+        }
+        if (t) setInput(prev => prev + (prev ? ' ' : '') + t);
+      };
+      recognitionRef.current.onend = () => setIsListening(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    let s: MediaStream | null = null;
+    if (settings.isCameraOn) {
+      navigator.mediaDevices.getUserMedia({ video: true })
+        .then(str => { s = str; if (videoRef.current) videoRef.current.srcObject = str; })
+        .catch(() => setSettings(p => ({ ...p, isCameraOn: false })));
+    }
+    return () => s?.getTracks().forEach(t => t.stop());
+  }, [settings.isCameraOn]);
+
+  const speak = (t: string, id: number) => {
+    window.speechSynthesis.cancel();
+    if (activeVoice === id) { setActiveVoice(null); return; }
+    const utter = new SpeechSynthesisUtterance(String(t).replace(/[*#$]/g, ''));
+    utter.onend = () => setActiveVoice(null);
+    setActiveVoice(id);
+    window.speechSynthesis.speak(utter);
+  };
+
+  const toggleVoice = () => {
+    if (isListening) recognitionRef.current?.stop();
+    else recognitionRef.current?.start();
+    setIsListening(!isListening);
+  };
+
+  const handleSend = async () => {
+    if (!input.trim() && !selectedImage) return;
+    const curIn = input;
+    const curImg = selectedImage;
+    const face = captureFrame();
+
+    const uMsg: Message = { role: 'user', text: curIn, image: curImg || undefined, timestamp: Date.now() };
+    setMessages(prev => [...prev, uMsg]);
+    setInput('');
+    setSelectedImage(null);
+    setLoading(true);
+
+    try {
+      const hist = messages.slice(-10).map(m => ({ role: m.role, text: m.text }));
+      const res = await academyService.current.processPedagogy(curIn, hist, settings, curImg || undefined, face || undefined);
+
+      const mText = `[[ASSESSMENT]]${res.assessment}[[CONTENT]]### ${res.subject}\n\n${res.explanation}\n\n---\n**Concept Check:** ${res.followUp}${
+        res.groundingLinks?.length ? `\n\n**Resources:**\n${res.groundingLinks.map(l => `• [${l.title}](${l.uri})`).join('\n')}` : ''
+      }`;
+
+      const mMsg: Message = { role: 'model', text: mText, timestamp: Date.now() };
+      setMessages(prev => [...prev, mMsg]);
+      setLoading(false);
+
+      if (res.visualPrompt) {
+        setVisualizing(true);
+        const vis = await academyService.current.generateVisual(res.visualPrompt);
+        if (vis) setMessages(prev => prev.map(m => m.timestamp === mMsg.timestamp ? { ...m, generatedVisual: vis } : m));
+        setVisualizing(false);
+      }
+      
+      if (settings.userMode === 'sight' || settings.preferredFormat !== 'Written') {
+        speak(res.explanation, mMsg.timestamp);
+      }
+    } catch (e) {
+      setMessages(p => [...p, { role: 'model', text: "Neural link interrupted. Re-checking synchronization...", timestamp: Date.now() }]);
+      setLoading(false);
+      setVisualizing(false);
+    }
+  };
+
+  const captureFrame = (): string | null => {
+    if (!settings.isCameraOn || !videoRef.current || !canvasRef.current) return null;
+    const ctx = canvasRef.current.getContext('2d');
+    if (!ctx) return null;
+    canvasRef.current.width = videoRef.current.videoWidth;
+    canvasRef.current.height = videoRef.current.videoHeight;
+    ctx.drawImage(videoRef.current, 0, 0);
+    setIsScanning(true);
+    setTimeout(() => setIsScanning(false), 1000);
+    return canvasRef.current.toDataURL('image/jpeg', 0.8);
+  };
+
+  const renderContent = (msg: Message) => {
+    let assessment = "";
+    let body = msg.text;
+    if (body.includes('[[ASSESSMENT]]')) {
+      const parts = body.split('[[ASSESSMENT]]')[1].split('[[CONTENT]]');
+      assessment = parts[0];
+      body = parts[1] || body;
+    }
+
+    const isSight = settings.userMode === 'sight';
+
+    return (
+      <div className="space-y-4">
+        {assessment && assessment.trim() !== "" && (
+          <div className="bg-cyan-500/10 border border-cyan-500/30 p-4 rounded-2xl flex gap-3 items-start animate-in fade-in slide-in-from-left-4">
+            <i className="fas fa-microchip text-cyan-400 mt-1"></i>
+            <div>
+              <p className="text-[10px] font-black uppercase text-cyan-400 tracking-widest mb-1">State Diagnostic</p>
+              <p className={`${isSight ? 'text-lg' : 'text-sm'} italic text-cyan-100/80 leading-snug`}>{assessment}</p>
+            </div>
+          </div>
+        )}
+
+        {msg.generatedVisual && (
+          <div className="rounded-3xl overflow-hidden border border-white/10 shadow-2xl group transition-transform hover:scale-[1.01]">
+            <img src={msg.generatedVisual} className="w-full object-cover aspect-video" alt="Visual aid" />
+            <div className="p-2 bg-slate-900/50 text-center text-[9px] font-bold text-slate-500 uppercase tracking-widest">
+              Neural Visualization Rendered
+            </div>
+          </div>
+        )}
+
+        <div className={`prose prose-invert ${isSight ? 'prose-lg' : 'prose-sm'} max-w-none math-render leading-relaxed`}>
+          {body.split('\n').map((line, i) => {
+             const t = line.trim();
+             if (t.startsWith('### ')) return <h3 key={i} className="text-xl font-bold text-cyan-400 mb-2 mt-4">{t.replace('### ', '')}</h3>;
+             if (t.startsWith('• ')) return <li key={i} className="ml-4 list-disc text-slate-300">{t.replace('• ', '')}</li>;
+             if (t.startsWith('---')) return <hr key={i} className="my-4 border-white/10" />;
+             if (t === "") return <div key={i} className="h-2" />;
+             return <p key={i} className="mb-2 text-slate-200">{line}</p>;
+          })}
+        </div>
+        
+        {(isSight || settings.preferredFormat === 'Voice') && (
+          <button onClick={() => speak(body, msg.timestamp)} className="flex items-center gap-2 px-4 py-2 bg-indigo-500/20 border border-indigo-500/30 rounded-full text-indigo-400 text-xs hover:bg-indigo-500 hover:text-white transition-all">
+            <i className={`fas ${activeVoice === msg.timestamp ? 'fa-stop' : 'fa-volume-up'}`}></i>
+            {activeVoice === msg.timestamp ? 'Stop Reading' : 'Listen to Step'}
+          </button>
+        )}
+      </div>
+    );
+  };
+
+  if (isConfiguring) {
+    return (
+      <div className="relative h-screen w-full flex items-center justify-center p-4 bg-slate-950 overflow-hidden">
+        <div className="absolute inset-0 pointer-events-none opacity-20 bg-[radial-gradient(circle_at_50%_50%,rgba(34,211,238,0.2),transparent_70%)]"></div>
+        <div className="glass-panel max-w-lg w-full p-8 rounded-[3rem] shadow-2xl animate-in zoom-in duration-500 border border-white/10 relative z-50">
+          <div className="flex justify-center mb-8">
+            <div className="w-20 h-20 bg-cyan-500/20 rounded-3xl flex items-center justify-center border border-cyan-500/30 shadow-[0_0_40px_rgba(34,211,238,0.1)]">
+              <i className="fas fa-brain text-cyan-400 text-4xl"></i>
+            </div>
+          </div>
+
+          {configStep === 0 && (
+            <div className="space-y-6">
+              <h2 className="text-3xl font-black italic uppercase tracking-tighter text-center">Researcher Identity</h2>
+              <input 
+                type="text" 
+                placeholder="Enter Identification Name..." 
+                className="w-full bg-slate-900 border-2 border-white/10 rounded-2xl p-5 text-white focus:border-cyan-500 outline-none transition-all text-center text-xl"
+                onKeyDown={(e) => { if(e.key === 'Enter') { 
+                  const n = (e.target as HTMLInputElement).value;
+                  if(n.trim()) { setSettings(p => ({ ...p, userName: n })); setConfigStep(1); }
+                }}}
+              />
+              <button onClick={(e) => {
+                const n = (e.currentTarget.previousSibling as HTMLInputElement).value;
+                if(n.trim()) { setSettings(p => ({ ...p, userName: n })); setConfigStep(1); }
+              }} className="w-full py-5 bg-cyan-500 text-black font-black uppercase tracking-widest rounded-2xl shadow-xl hover:bg-cyan-400 transition-all">Register Identity</button>
+            </div>
+          )}
+
+          {configStep === 1 && (
+            <div className="space-y-6">
+              <h2 className="text-3xl font-black italic uppercase tracking-tighter text-center">Neural Subject</h2>
+              <div className="grid grid-cols-1 gap-3">
+                {(['Math', 'Computer Science', 'Physics'] as Subject[]).map(s => (
+                  <button key={s} onClick={() => setSettings(p => ({ ...p, activeSubject: s }))} className={`py-4 rounded-2xl border-2 transition-all font-bold ${settings.activeSubject === s ? 'bg-cyan-500 text-black border-cyan-400' : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'}`}>
+                    {s}
+                  </button>
+                ))}
+              </div>
+              <input 
+                type="text" 
+                placeholder="Specific Topic (e.g., Quantum Gravity)..." 
+                className="w-full bg-slate-900 border-2 border-white/10 rounded-2xl p-4 text-white focus:border-cyan-500 outline-none transition-all text-center"
+                onChange={(e) => setSettings(p => ({ ...p, activeTopic: e.target.value }))}
+              />
+              <button onClick={() => settings.activeSubject !== 'None' && settings.activeTopic && setConfigStep(2)} className="w-full py-5 bg-cyan-500 text-black font-black uppercase tracking-widest rounded-2xl shadow-xl disabled:opacity-50" disabled={settings.activeSubject === 'None' || !settings.activeTopic}>Confirm Topic</button>
+            </div>
+          )}
+
+          {configStep === 2 && (
+            <div className="space-y-6">
+              <h2 className="text-3xl font-black italic uppercase tracking-tighter text-center">Protocol Stream</h2>
+              <div className="space-y-4">
+                <p className="text-[10px] uppercase font-black tracking-widest text-slate-500 text-center">Format</p>
+                <div className="flex gap-2">
+                  {(['Voice', 'Written', 'Both'] as const).map(f => (
+                    <button key={f} onClick={() => setSettings(p => ({ ...p, preferredFormat: f }))} className={`flex-1 py-3 rounded-xl border transition-all text-xs font-bold ${settings.preferredFormat === f ? 'bg-indigo-500 border-indigo-400' : 'bg-white/5 border-transparent text-slate-500'}`}>{f}</button>
+                  ))}
+                </div>
+                <p className="text-[10px] uppercase font-black tracking-widest text-slate-500 text-center">Accessibility Mode</p>
+                <div className="flex gap-2">
+                  {(['normal', 'hearing', 'sight'] as UserMode[]).map(m => (
+                    <button key={m} onClick={() => setSettings(p => ({ ...p, userMode: m }))} className={`flex-1 py-3 rounded-xl border transition-all text-xs font-bold uppercase ${settings.userMode === m ? 'bg-cyan-500 text-black border-cyan-400' : 'bg-white/5 border-transparent text-slate-500'}`}>{m}</button>
+                  ))}
+                </div>
+                <button 
+                  onClick={() => setSettings(p => ({ ...p, advancedMode: !p.advancedMode }))}
+                  className={`w-full py-3 rounded-xl border transition-all text-xs font-bold uppercase flex items-center justify-center gap-2 ${settings.advancedMode ? 'bg-amber-500 text-black border-amber-400 shadow-[0_0_20px_rgba(245,158,11,0.2)]' : 'bg-white/5 border-transparent text-slate-500'}`}
+                >
+                  <i className="fas fa-brain"></i>
+                  {settings.advancedMode ? 'Advanced Engine Active' : 'Enable Advanced Engine (Web Search)'}
+                </button>
+              </div>
+              <button onClick={() => setConfigStep(3)} className="w-full py-5 bg-cyan-500 text-black font-black uppercase tracking-widest rounded-2xl shadow-xl">Set Preferences</button>
+            </div>
+          )}
+
+          {configStep === 3 && (
+            <div className="space-y-6">
+              <h2 className="text-3xl font-black italic uppercase tracking-tighter text-center">Session Metrics</h2>
+              <div className="grid grid-cols-1 gap-3">
+                {(['Short (15 min)', 'Medium (30 min)', 'Long (45-60 min)'] as SessionLength[]).map(l => (
+                  <button key={l} onClick={() => setSettings(p => ({ ...p, sessionLength: l }))} className={`py-4 rounded-2xl border-2 transition-all font-bold ${settings.sessionLength === l ? 'bg-cyan-500 text-black border-cyan-400' : 'bg-white/5 border-white/5 text-slate-400 hover:text-white'}`}>
+                    {l}
+                  </button>
+                ))}
+              </div>
+              <button onClick={() => { setIsConfiguring(false); }} className="w-full py-5 bg-cyan-500 text-black font-black uppercase tracking-widest rounded-2xl shadow-xl">Initialize Session</button>
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="relative h-screen w-full flex items-center justify-center p-0 sm:p-4 bg-slate-950 overflow-hidden">
+      <div className="absolute inset-0 pointer-events-none opacity-10 bg-[radial-gradient(circle_at_20%_20%,rgba(34,211,238,0.3),transparent_40%),radial-gradient(circle_at_80%_80%,rgba(99,102,241,0.3),transparent_40%)]"></div>
+      
+      <div className="glass-panel w-full max-w-6xl h-full sm:h-[94vh] flex flex-col relative z-10 sm:rounded-[2.5rem] shadow-2xl overflow-hidden border border-white/10">
+        <header className="px-6 py-4 flex flex-col sm:flex-row justify-between items-center gap-4 bg-white/5 border-b border-white/10 backdrop-blur-md">
+          <div className="flex items-center gap-4">
+            <div className="w-10 h-10 rounded-xl bg-cyan-500/20 border border-cyan-500/30 flex items-center justify-center animate-pulse">
+              <i className="fas fa-atom text-cyan-400 text-xl"></i>
+            </div>
+            <div>
+              <h1 className="text-lg font-black italic tracking-tighter uppercase leading-none">Quantum Academy</h1>
+              <div className="flex items-center gap-2 mt-1">
+                <span className="text-[8px] font-bold text-slate-400 uppercase tracking-widest">
+                  {settings.activeSubject}: {settings.activeTopic} // Mode: {settings.interactionMode}
+                </span>
+              </div>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-2">
+            <div className="flex p-1 bg-slate-900 rounded-xl border border-white/10">
+              {(['teaching', 'chatbot'] as InteractionMode[]).map(m => (
+                <button key={m} onClick={() => setSettings(p => ({ ...p, interactionMode: m }))} className={`px-4 py-1.5 rounded-lg text-[9px] font-black uppercase tracking-widest transition-all ${settings.interactionMode === m ? 'bg-cyan-500 text-black shadow-lg' : 'text-slate-500'}`}>
+                  {m}
+                </button>
+              ))}
+            </div>
+            
+            <button 
+              onClick={() => setSettings(p => ({ ...p, advancedMode: !p.advancedMode }))} 
+              className={`w-9 h-9 rounded-xl flex items-center justify-center border transition-all ${settings.advancedMode ? 'bg-amber-500 border-amber-400 text-black shadow-[0_0_15px_rgba(245,158,11,0.3)]' : 'bg-slate-800 border-white/5 text-slate-500'}`}
+              title="Advanced Mode (Web Grounding)"
+            >
+              <i className="fas fa-brain"></i>
+            </button>
+
+            <button onClick={() => setSettings(p => ({ ...p, isCameraOn: !p.isCameraOn }))} className={`w-9 h-9 rounded-xl flex items-center justify-center transition-all ${settings.isCameraOn ? 'bg-cyan-500 text-black shadow-[0_0_15px_rgba(34,211,238,0.3)]' : 'bg-slate-800 text-slate-500'}`} title="Biometric Camera">
+              <i className={`fas ${settings.isCameraOn ? 'fa-video' : 'fa-video-slash'}`}></i>
+            </button>
+            <button onClick={() => { localStorage.clear(); window.location.reload(); }} className="w-9 h-9 rounded-xl bg-slate-800 text-slate-500 hover:bg-red-500 hover:text-white transition-all flex items-center justify-center" title="Reset Session">
+              <i className="fas fa-power-off"></i>
+            </button>
+          </div>
+        </header>
+
+        {settings.isCameraOn && (
+          <div className="absolute top-20 right-6 w-32 sm:w-44 aspect-square rounded-[2rem] overflow-hidden border-2 border-cyan-500/50 shadow-2xl z-20 transition-all hover:scale-110">
+            <video ref={videoRef} autoPlay muted playsInline className="w-full h-full object-cover grayscale brightness-110 contrast-125" />
+            <div className="absolute inset-0 pointer-events-none biometric-scan-line bg-cyan-400/20 h-0.5 shadow-[0_0_10px_rgba(34,211,238,0.5)]"></div>
+            {isScanning && <div className="absolute inset-0 bg-white/20 animate-pulse"></div>}
+          </div>
+        )}
+        <canvas ref={canvasRef} className="hidden" />
+
+        <div className="flex-1 overflow-y-auto p-4 sm:p-8 space-y-8 scroll-smooth scrollbar-hide">
+          {messages.length === 0 && !loading && (
+            <div className="flex flex-col items-center justify-center h-full text-center space-y-4 opacity-30">
+              <i className="fas fa-satellite-dish text-6xl text-cyan-500 animate-pulse"></i>
+              <p className="text-sm font-black uppercase tracking-widest italic">Awaiting Neural Link Initiation...</p>
+            </div>
+          )}
+          {messages.map((m, i) => (
+            <div key={m.timestamp + i} className={`flex ${m.role === 'user' ? 'justify-end' : 'justify-start'} animate-in fade-in slide-in-from-bottom-2`}>
+              <div className={`flex gap-4 max-w-[95%] sm:max-w-[80%] ${m.role === 'user' ? 'flex-row-reverse' : 'flex-row'}`}>
+                <div className={`w-9 h-9 rounded-xl flex-shrink-0 flex items-center justify-center mt-1 border ${m.role === 'user' ? 'bg-indigo-600 border-indigo-500' : 'bg-slate-800 border-slate-700 text-cyan-400'}`}>
+                  <i className={`fas ${m.role === 'user' ? 'fa-user' : 'fa-robot'}`}></i>
+                </div>
+                <div className={`p-5 rounded-[1.5rem] shadow-xl border ${m.role === 'user' ? 'bg-indigo-600 text-white border-indigo-500 rounded-tr-none' : 'bg-white/5 backdrop-blur-md text-slate-200 border-white/10 rounded-tl-none'}`}>
+                  {m.image && <img src={m.image} className="max-w-xs rounded-xl mb-4 border-2 border-white/10" alt="User Input" />}
+                  {m.role === 'model' ? renderContent(m) : <p className={`leading-relaxed ${settings.userMode === 'sight' ? 'text-lg' : 'text-sm'}`}>{String(m.text)}</p>}
+                </div>
+              </div>
+            </div>
+          ))}
+          {(loading || visualizing) && (
+            <div className="flex justify-start animate-pulse">
+               <div className="flex gap-4 items-center">
+                <div className="w-9 h-9 rounded-xl bg-slate-800 border border-slate-700"></div>
+                <div className="px-6 py-4 bg-white/5 border border-white/10 rounded-[1.5rem] rounded-tl-none flex items-center gap-3">
+                  <div className="flex gap-1">
+                    <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce"></span>
+                    <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce [animation-delay:0.2s]"></span>
+                    <span className="w-1.5 h-1.5 bg-cyan-400 rounded-full animate-bounce [animation-delay:0.4s]"></span>
+                  </div>
+                  <span className="text-[9px] font-black uppercase text-cyan-400 tracking-widest">{visualizing ? 'Visualizing...' : 'Processing...'}</span>
+                </div>
+              </div>
+            </div>
+          )}
+          <div ref={scrollRef} />
+        </div>
+
+        <div className="p-4 sm:p-6 bg-white/5 border-t border-white/10 backdrop-blur-2xl">
+          {selectedImage && (
+            <div className="mb-4 relative inline-block group animate-in slide-in-from-bottom-2">
+              <img src={selectedImage} className="w-20 h-20 object-cover rounded-xl ring-2 ring-cyan-500/50" alt="Preview" />
+              <button onClick={() => setSelectedImage(null)} className="absolute -top-2 -right-2 bg-red-500 text-white w-6 h-6 rounded-full flex items-center justify-center text-[10px] shadow-xl hover:scale-110 transition-transform">
+                <i className="fas fa-times"></i>
+              </button>
+            </div>
+          )}
+
+          <div className="flex items-end gap-3 max-w-4xl mx-auto">
+            <div className="flex-1 relative">
+              <textarea 
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={(e) => { if(e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+                placeholder={isListening ? "Listening..." : settings.interactionMode === 'teaching' ? "Respond to your tutor..." : "Neural query..."}
+                className={`w-full p-4 pr-24 bg-slate-950/80 border-2 rounded-2xl transition-all outline-none resize-none h-14 max-h-40 focus:ring-4 focus:ring-cyan-500/10 ${isListening ? 'border-red-500/50 shadow-[0_0_15px_rgba(239,68,68,0.2)]' : 'border-white/5 focus:border-cyan-500/50'}`}
+              />
+              <div className="absolute right-3 bottom-3 flex gap-2">
+                <button onClick={toggleVoice} className={`w-8 h-8 rounded-lg flex items-center justify-center transition-all ${isListening ? 'bg-red-500 text-white' : 'text-slate-500 hover:text-white hover:bg-white/5'}`}>
+                  <i className={`fas ${isListening ? 'fa-stop' : 'fa-microphone'}`}></i>
+                </button>
+                <label className="w-8 h-8 rounded-lg flex items-center justify-center cursor-pointer text-slate-500 hover:text-white hover:bg-white/5 transition-all">
+                  <i className="fas fa-paperclip"></i>
+                  <input type="file" className="hidden" accept="image/*" onChange={(e) => {
+                    const f = e.target.files?.[0];
+                    if(f) { const r = new FileReader(); r.onload = (re) => setSelectedImage(re.target?.result as string); r.readAsDataURL(f); }
+                  }} />
+                </label>
+              </div>
+            </div>
+            <button onClick={handleSend} disabled={loading || (!input.trim() && !selectedImage)} className={`w-14 h-14 rounded-2xl flex items-center justify-center transition-all shadow-2xl ${loading || (!input.trim() && !selectedImage) ? 'bg-slate-800 text-slate-600' : 'bg-cyan-500 text-black hover:bg-cyan-400 hover:scale-105 active:scale-95'}`}>
+              <i className={`fas ${loading ? 'fa-spinner fa-spin' : 'fa-paper-plane'} text-lg`}></i>
+            </button>
+          </div>
+          <div className="mt-4 text-center">
+            <p className="text-[7px] font-bold text-slate-600 uppercase tracking-widest flex items-center justify-center gap-2">
+              <span className="w-1 h-1 bg-green-500 rounded-full animate-pulse"></span>
+              Neural Authenticated: {settings.userName || 'GUEST'} // Subject: {settings.activeSubject} // Format: {settings.preferredFormat}
+            </p>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+export default App;
